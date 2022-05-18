@@ -9,6 +9,16 @@
 import Cocoa
 import Mustache
 
+fileprivate let isMacOS11: Bool = {
+  var res = false
+  if #available(macOS 11.0, *) {
+    if #available(macOS 12.0, *) {} else {
+      res = true
+    }
+  }
+  return res
+}()
+
 fileprivate let TitleBarHeightNormal: CGFloat = {
   if #available(macOS 10.16, *) {
     return 28
@@ -538,6 +548,7 @@ class MainWindowController: PlayerWindowController {
     thumbnailPeekView.isHidden = true
 
     // other initialization
+    osdAccessoryProgress.usesThreadedAnimation = false
     if #available(macOS 10.14, *) {
       titleBarBottomBorder.fillColor = NSColor(named: .titleBarBorder)!
     }
@@ -577,6 +588,12 @@ class MainWindowController: PlayerWindowController {
       // Update the cached value
       self.cachedScreenCount = screenCount
       self.videoView.updateDisplayLink()
+      // In normal full screen mode AppKit will automatically adjust the window frame if the window
+      // is moved to a new screen such as when the window is on an external display and that display
+      // is disconnected. In legacy full screen mode IINA is responsible for adjusting the window's
+      // frame.
+      guard self.fsState.isFullscreen, Preference.bool(for: .useLegacyFullScreen) else { return }
+      setWindowFrameForLegacyFullScreen()
     }
   }
 
@@ -702,9 +719,14 @@ class MainWindowController: PlayerWindowController {
       oscFloatingTopView.addView(fragVolumeView, in: .leading)
       oscFloatingTopView.addView(fragToolbarView, in: .trailing)
       oscFloatingTopView.addView(fragControlView, in: .center)
-      oscFloatingTopView.setVisibilityPriority(.detachOnlyIfNecessary, for: fragVolumeView)
-      oscFloatingTopView.setVisibilityPriority(.detachOnlyIfNecessary, for: fragToolbarView)
-      oscFloatingTopView.setClippingResistancePriority(.defaultLow, for: .horizontal)
+      
+      // Setting the visibility priority to detach only will cause freeze when resizing the window
+      // (and triggering the detach) in macOS 11.
+      if !isMacOS11 {
+        oscFloatingTopView.setVisibilityPriority(.detachOnlyIfNecessary, for: fragVolumeView)
+        oscFloatingTopView.setVisibilityPriority(.detachOnlyIfNecessary, for: fragToolbarView)
+        oscFloatingTopView.setClippingResistancePriority(.defaultLow, for: .horizontal)
+      }
       oscFloatingBottomView.addSubview(fragSliderView)
       Utility.quickConstraints(["H:|[v]|", "V:|[v]|"], ["v": fragSliderView])
       Utility.quickConstraints(["H:|-(>=0)-[v]-(>=0)-|"], ["v": fragControlView])
@@ -985,19 +1007,48 @@ class MainWindowController: PlayerWindowController {
   // MARK: - Window delegate: Open / Close
 
   func windowWillOpen() {
-    var screen = window!.screen!
+    if #available(macOS 12, *) {
+      // Apparently Apple fixed AppKit for Monterey so the workaround below is only needed for
+      // previous versions of macOS. Support for #unavailable is coming in Swift 5.6. The version of
+      // Xcode being used at the time of this writing supports Swift 5.5.
+    } else {
+      // Must workaround an AppKit defect in earlier versions of macOS. This defect is known to
+      // exist in Catalina and Big Sur. The problem was not reproducible in Monterey. The status of
+      // other versions of macOS is unknown, however the workaround should be safe to apply in any
+      // version of macOS. The problem was reported in issues #3159, #3097 and #3253. The titles of
+      // open windows shown in the "Window" menu are automatically managed by the AppKit framework.
+      // To improve performance PlayerCore caches and reuses player instances along with their
+      // windows. This technique is valid and recommended by Apple. But in older versions of macOS,
+      // if a window is reused the framework will display the title first used for the window in the
+      // "Window" menu even after IINA has updated the title of the window. This problem can also be
+      // seen when right-clicking or control-clicking the IINA icon in the dock. As a workaround
+      // reset the window's title to "Window" before it is reused. This is the default title AppKit
+      // assigns to a window when it is first created. Surprising and rather disturbing this works
+      // as a workaround, but it does.
+      window!.title = "Window"
+    }
+
+    // As there have been issues in this area, log details about the screen selection process.
+    NSScreen.log("window!.screen", window!.screen)
+    NSScreen.log("NSScreen.main", NSScreen.main)
+    NSScreen.screens.enumerated().forEach { screen in
+      NSScreen.log("NSScreen.screens[\(screen.offset)]" , screen.element)
+    }
+
+    var screen = window!.selectDefaultScreen()
 
     if let rectString = UserDefaults.standard.value(forKey: "MainWindowLastPosition") as? String {
       let rect = NSRectFromString(rectString)
       if let lastScreen = NSScreen.screens.first(where: { NSPointInRect(rect.origin, $0.visibleFrame) }) {
         screen = lastScreen
+        NSScreen.log("MainWindowLastPosition \(rect.origin) matched", screen)
       }
     }
 
     if shouldApplyInitialWindowSize, let wfg = windowFrameFromGeometry(newSize: AppData.sizeWhenNoVideo, screen: screen) {
-      window!.setFrame(wfg, display: true)
+      window!.setFrame(wfg, display: true, animate: !AccessibilityPreferences.motionReductionEnabled)
     } else {
-      window!.setFrame(AppData.sizeWhenNoVideo.centeredRect(in: screen.visibleFrame), display: true)
+      window!.setFrame(AppData.sizeWhenNoVideo.centeredRect(in: screen.visibleFrame), display: true, animate: !AccessibilityPreferences.motionReductionEnabled)
     }
 
     videoView.videoLayer.draw(forced: true)
@@ -1074,7 +1125,7 @@ class MainWindowController: PlayerWindowController {
   func window(_ window: NSWindow, startCustomAnimationToEnterFullScreenOn screen: NSScreen, withDuration duration: TimeInterval) {
     NSAnimationContext.runAnimationGroup({ context in
       context.duration = duration
-      window.animator().setFrame(screen.frame, display: true)
+      window.animator().setFrame(screen.frame, display: true, animate: !AccessibilityPreferences.motionReductionEnabled)
     }, completionHandler: nil)
 
   }
@@ -1087,7 +1138,7 @@ class MainWindowController: PlayerWindowController {
 
     NSAnimationContext.runAnimationGroup({ context in
       context.duration = duration
-      window.animator().setFrame(priorWindowedFrame, display: true)
+      window.animator().setFrame(priorWindowedFrame, display: true, animate: !AccessibilityPreferences.motionReductionEnabled)
     }, completionHandler: nil)
 
     NSMenu.setMenuBarVisible(true)
@@ -1199,6 +1250,11 @@ class MainWindowController: PlayerWindowController {
   }
 
   func windowDidExitFullScreen(_ notification: Notification) {
+    if AccessibilityPreferences.motionReductionEnabled {
+      // When animation is not used exiting full screen does not restore the previous size of the
+      // window. Restore it now.
+      window!.setFrame(fsState.priorWindowedFrame!, display: true, animate: false)
+    }
     if oscPosition != .top {
       addBackTitlebarViewToFadeableViews()
     }
@@ -1279,7 +1335,7 @@ class MainWindowController: PlayerWindowController {
     }
  
     restoreDockSettings()
-    // restore window frame ans aspect ratio
+    // restore window frame and aspect ratio
     let videoSize = player.videoSizeForDisplay
     let aspectRatio = NSSize(width: videoSize.0, height: videoSize.1)
     let useAnimation = Preference.bool(for: .legacyFullScreenAnimation)
@@ -1293,6 +1349,20 @@ class MainWindowController: PlayerWindowController {
     window.aspectRatio = aspectRatio
     // call delegate
     windowDidExitFullScreen(Notification(name: .iinaLegacyFullScreen))
+  }
+
+  /// Set the window frame and if needed the content view frame to appropriately use the full screen.
+  ///
+  /// For screens that contain a camera housing the content view will be adjusted to not use that area of the screen.
+  private func setWindowFrameForLegacyFullScreen() {
+    guard let window = self.window else { return }
+    let screen = window.screen ?? NSScreen.main!
+    window.setFrame(screen.frame, display: true, animate: !AccessibilityPreferences.motionReductionEnabled)
+    guard let unusable = screen.cameraHousingHeight else { return }
+    // This screen contains an embedded camera. Shorten the height of the window's content view's
+    // frame to avoid having part of the window obscured by the camera housing.
+    let view = window.contentView!
+    view.setFrameSize(NSMakeSize(view.frame.width, screen.frame.height - unusable))
   }
 
   private func legacyAnimateToFullscreen() {
@@ -1313,9 +1383,8 @@ class MainWindowController: PlayerWindowController {
     // auto hide menubar and dock
     NSApp.presentationOptions.insert(.autoHideMenuBar)
     NSApp.presentationOptions.insert(.autoHideDock)
-    // set frame
-    let screen = window.screen ?? NSScreen.main!
-    window.setFrame(screen.frame, display: true, animate: true)
+    // set window frame and in some cases content view frame
+    setWindowFrameForLegacyFullScreen()
     // call delegate
     windowDidEnterFullScreen(Notification(name: .iinaLegacyFullScreen))
   }
@@ -1398,6 +1467,36 @@ class MainWindowController: PlayerWindowController {
 
       controlBarFloating.xConstraint.constant = xPos
       controlBarFloating.yConstraint.constant = yPos
+    }
+    
+    // Detach the views in oscFloatingTopView manually on macOS 11 only; as it will cause freeze
+    if isMacOS11 && oscPosition == .floating {
+      guard let maxWidth = [fragVolumeView, fragToolbarView].compactMap({ $0?.frame.width }).max() else {
+        return
+      }
+      
+      // window - 10 - controlBarFloating
+      // controlBarFloating - 12 - oscFloatingTopView
+      let margin: CGFloat = (10 + 12) * 2
+      let hide = (window.frame.width
+                    - fragControlView.frame.width
+                    - maxWidth*2
+                    - margin) < 0
+      
+      let views = oscFloatingTopView.views
+      if hide {
+        if views.contains(fragVolumeView)
+            && views.contains(fragToolbarView) {
+          oscFloatingTopView.removeView(fragVolumeView)
+          oscFloatingTopView.removeView(fragToolbarView)
+        }
+      } else {
+        if !views.contains(fragVolumeView)
+            && !views.contains(fragToolbarView) {
+          oscFloatingTopView.addView(fragVolumeView, in: .leading)
+          oscFloatingTopView.addView(fragToolbarView, in: .trailing)
+        }
+      }
     }
   }
 
@@ -1576,7 +1675,29 @@ class MainWindowController: PlayerWindowController {
       window?.title = player.getMediaTitle()
     } else {
       window?.representedURL = player.info.currentURL
-      window?.setTitleWithRepresentedFilename(player.info.currentURL?.path ?? "")
+      // Workaround for issue #3543, IINA crashes reporting:
+      // NSInvalidArgumentException [NSNextStepFrame _displayName]: unrecognized selector
+      // When running on an M1 under Big Sur and using legacy full screen.
+      //
+      // Changes in Big Sur broke the legacy full screen feature. The MainWindowController method
+      // legacyAnimateToFullscreen had to be changed to get this feature working again. Under Big
+      // Sur that method now calls "window.styleMask.remove(.titled)". Removing titled from the
+      // style mask causes the AppKit method NSWindow.setTitleWithRepresentedFilename to trigger the
+      // exception listed above. This appears to be a defect in the Cocoa framework. The window's
+      // title can still be set directly without triggering the exception. The problem seems to be
+      // isolated to the setTitleWithRepresentedFilename method, possibly only when running on an
+      // Apple Silicon based Mac. Based on the Apple documentation setTitleWithRepresentedFilename
+      // appears to be a convenience method. As a workaround for the issue directly set the window
+      // title.
+      //
+      // This problem has been reported to Apple as:
+      // "setTitleWithRepresentedFilename throws NSInvalidArgumentException: NSNextStepFrame _displayName"
+      // Feedback number FB9789129
+      if Preference.bool(for: .useLegacyFullScreen), #available(macOS 11, *) {
+        window?.title = player.info.currentURL?.lastPathComponent ?? ""
+      } else {
+        window?.setTitleWithRepresentedFilename(player.info.currentURL?.path ?? "")
+      }
     }
     addDocIconToFadeableViews()
   }
@@ -1727,7 +1848,7 @@ class MainWindowController: PlayerWindowController {
     viewController.downShift = titleBarView.frame.height
     // show sidebar
     NSAnimationContext.runAnimationGroup({ (context) in
-      context.duration = SideBarAnimationDuration
+      context.duration = AccessibilityPreferences.adjustedDuration(SideBarAnimationDuration)
       context.timingFunction = CAMediaTimingFunction(name: .easeIn)
       sideBarRightConstraint.animator().constant = 0
     }) {
@@ -1740,7 +1861,7 @@ class MainWindowController: PlayerWindowController {
     sidebarAnimationState = .willHide
     let currWidth = sideBarWidthConstraint.constant
     NSAnimationContext.runAnimationGroup({ (context) in
-      context.duration = animate ? SideBarAnimationDuration : 0
+      context.duration = animate ? AccessibilityPreferences.adjustedDuration(SideBarAnimationDuration) : 0
       context.timingFunction = CAMediaTimingFunction(name: .easeIn)
       sideBarRightConstraint.animator().constant = -currWidth
     }) {
@@ -1789,7 +1910,7 @@ class MainWindowController: PlayerWindowController {
   }
 
   // Sometimes the doc icon may not be available, eg. when opened an online video.
-  // We should try to add it everytime when window title changed.
+  // We should try to add it every time when window title changed.
   private func addDocIconToFadeableViews() {
     if let docIcon = window?.standardWindowButton(.documentIconButton), !fadeableViews.contains(docIcon) {
       fadeableViews.append(docIcon)
@@ -2402,7 +2523,7 @@ class MainWindowController: PlayerWindowController {
   /// Legacy IBAction, but still in use.
   func settingsButtonAction(_ sender: AnyObject) {
     if sidebarAnimationState == .willShow || sidebarAnimationState == .willHide {
-      return  // do not interrput other actions while it is animating
+      return  // do not interrupt other actions while it is animating
     }
     let view = quickSettingView
     switch sideBarStatus {
@@ -2420,7 +2541,7 @@ class MainWindowController: PlayerWindowController {
   /// Legacy IBAction, but still in use.
   func playlistButtonAction(_ sender: AnyObject) {
     if sidebarAnimationState == .willShow || sidebarAnimationState == .willHide {
-      return  // do not interrput other actions while it is animating
+      return  // do not interrupt other actions while it is animating
     }
     let view = playlistView
     switch sideBarStatus {
